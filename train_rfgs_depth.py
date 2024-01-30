@@ -1,21 +1,21 @@
 
-import torch
-from utils.tensorf_utils import N_to_reso, cal_n_samples
-from renderer_rf import *
-from dataLoader import dataset_dict
 
+import torch
+import uuid
+import imageio
 from random import randint
+from torch.utils.tensorboard import SummaryWriter
+
+from utils.tensorf_utils import N_to_reso, cal_n_samples
 from utils.loss_utils import l1_loss, ssim
 from utils.image_utils import psnr
+from renderer_rf import *
+from arguments import ModelParams, OptimizationParams, PipelineParams
+
+from dataLoader import dataset_dict
 from scene import Scene, GaussianModel
 from gaussian_renderer import render, network_gui
 from argparse import ArgumentParser, Namespace
-from arguments import ModelParams, OptimizationParams, PipelineParams
-import uuid
-from torch.utils.tensorboard import SummaryWriter
-
-import imageio
-
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -38,9 +38,8 @@ class SimpleSampler:
         self.current += self.batch
         return batch_ids
 
-# args
+# Args
 datadir = './data/nerf_synthetic/lego'
-
 batch_size = 4096
 
 N_voxel_init = 2097156
@@ -50,16 +49,15 @@ update_AlphaMask_list = [2000, 4000]
 
 N_vis = 5
 vis_every = 5000
-
-n_lamb_sigma = [16, 16, 16]
-n_lamb_sh = [48, 48, 48]
-model_name = 'TensorVMSplit'
-
-L1_weight_inital = 8e-5
-L1_weight_rest = 4e-5
-
 nSamples = 1e6
 step_ratio = 0.5
+
+model_name = 'TensorVMSplit'
+L1_weight_inital = 8e-5
+L1_weight_rest = 4e-5
+n_lamb_sigma = [16, 16, 16]
+n_lamb_sh = [48, 48, 48]
+
 alpha_mask_thre = 0.0001
 distance_scale = 25
 density_shift = -10
@@ -68,35 +66,33 @@ lr_init = 0.02
 lr_basis = 1e-3
 lr_decay_target_ratio = 0.1
 
-# dataset
+# Dataset
 dataset_rf = dataset_dict['blender'](datadir)
-
-# log file
-logfolder_rf = './log/tensorf'
-summary_writer_rf = SummaryWriter(logfolder_rf)
-
-# parameters
 aabb = dataset_rf.scene_bbox.to(device)
-reso_cur = N_to_reso(N_voxel_init, aabb)
-nSamples = min(nSamples, cal_n_samples(reso_cur, step_ratio)) # 1e6 | 443
 
-# model
+# Resolution
+reso_cur = N_to_reso(N_voxel_init, aabb)
+nSamples = min(nSamples, cal_n_samples(reso_cur, step_ratio))
+
+# Log
+summary_writer_rf = SummaryWriter('./log/tensorf')
+
+# NeRF model
 tensorf = eval(model_name)(aabb, reso_cur, device, density_n_comp=n_lamb_sigma, appearance_n_comp=n_lamb_sh,
                            near_far=dataset_rf.near_far, alphaMask_thres=alpha_mask_thre, density_shift=density_shift,
                            distance_scale=distance_scale, step_ratio=step_ratio)
 
-# Combine train and test datasets for TensoRF
+# Process rays and RGBs
 allrays_rf, allrgbs_rf = dataset_rf.all_rays, dataset_rf.all_rgbs
 allrays_rf, allrgbs_rf = tensorf.filtering_rays(allrays_rf, allrgbs_rf, bbox_only=True)
 Sampler_rf = SimpleSampler(allrays_rf.shape[0], batch_size)
 
-# optimizer 
+# Optimizer 
 grad_vars_rf = tensorf.get_optparam_groups(lr_init, lr_basis)
 optimizer_rf = torch.optim.Adam(grad_vars_rf, betas=(0.9,0.99))
+
 lr_factor_rf = (lr_decay_target_ratio) ** (1/n_iterations)
 L1_reg_weight = L1_weight_inital
-
-# upsample
 N_voxel_list = (torch.round(torch.exp(torch.linspace(np.log(N_voxel_init), np.log(N_voxel_final), len(upsamp_list)+1))).long()).tolist()[1:]
 
 ### Gaussion Splatting ###
@@ -107,7 +103,7 @@ def prepare_output_and_logger(model_path):
             unique_str = os.getenv('OAR_JOB_ID')
         else: #
             unique_str = str(uuid.uuid4())
-        model_path = os.path.join("./output/", unique_str[0:10]) # ./output/8c0b6b47-c
+        model_path = os.path.join("./log/3dgs", unique_str[0:10])
 
     # Set up output folder
     os.makedirs(model_path, exist_ok=True)
@@ -163,24 +159,21 @@ op = OptimizationParams(parser)
 pp = PipelineParams(parser)
 args = parser.parse_args(sys.argv[1:])
 
-dataset_gs = lp.extract(args) # in fact, model params
+dataset_gs = lp.extract(args)
 opt = op.extract(args)
 pipe = pp.extract(args)
 
 # parameters
-# testing_iterations = [7000, 30000]
-# saving_iterations = [7000, 30000]
 testing_iterations = [7000, 15000]
 saving_iterations = [7000, 15000]
 checkpoint_gs_iterations = []
 debug_from = -1
 
-# some other parameters
 first_iter = 0
 tb_writer = prepare_output_and_logger(model_path='')
 
 sh_degree = 3
-gaussians = GaussianModel(sh_degree) # what does it return?
+gaussians = GaussianModel(sh_degree)
 scene = Scene(dataset_gs, gaussians)
 gaussians.training_setup(opt)
 
@@ -190,22 +183,18 @@ background = torch.tensor(bg_color, dtype=torch.float32, device=device)
 iter_start = torch.cuda.Event(enable_timing=True)
 iter_end = torch.cuda.Event(enable_timing=True)
 
-ema_loss_for_log = 0.0 # for exponentially moving avg?
+ema_loss_for_log = 0.0
 
-#### TRAINING ... ####
-# rf
 torch.cuda.empty_cache()
 PSNRs_rf = []
 
-# gs
 progress_bar = tqdm(range(first_iter, n_iterations), desc="Training progress")
 first_iter += 1
 
 for iteration in range(first_iter, n_iterations + 1):
-    # TensoRF
+    ''' TensoRF '''
     ray_idx = Sampler_rf.next_ids()
     ray_rf, rgb_gt_rf = allrays_rf[ray_idx], allrgbs_rf[ray_idx].to(device)
-
     rgb_map_rf, depth_map_rf = OctreeRender_trilinear_fast(ray_rf, tensorf, chunk=batch_size, N_samples=nSamples, is_train=True, device=device)
 
     # loss
@@ -246,21 +235,8 @@ for iteration in range(first_iter, n_iterations + 1):
         tensorf.upsample_volume_grid(reso_cur)
         grad_vars_rf = tensorf.get_optparam_groups(lr_init, lr_basis)
         optimizer_rf = torch.optim.Adam(grad_vars_rf, betas=(0.9, 0.99))
-    
-    # print('rf_depth.shape: ', depth_map_rf.shape) # torch.Size([4096])
-    # assert False
-    # if iteration % 50 == 0:
-    #     depth_rf_np = depth_map_rf.squeeze().cpu().detach().numpy()
-    #     depth_min = depth_rf_np.min()
-    #     depth_max = depth_rf_np.max()
-    #     depth_range = depth_max - depth_min
-    #     depth_scaled = (depth_rf_np - depth_min) / depth_range  # Normalize to 0-1
-    #     depth_uint8 = (depth_scaled * 255).astype(np.uint8)  # Scale to 0-255
-    #     imageio.imwrite('depth_rf.png', depth_uint8)
-    #     # assert False
-    
-###############################################################################################################################################################################################
-    # Gaussion Splatting
+
+    ''' Gaussion Splatting '''
     if network_gui.conn == None:
         network_gui.try_connect()
     iter_start.record()
@@ -279,56 +255,47 @@ for iteration in range(first_iter, n_iterations + 1):
     render_pkg = render(viewpoint_cam, gaussians, pipe, bg)
     image, viewspace_point_tensor, visibility_filter, radii, depth_gs = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"], render_pkg["depth"]
     
-
-    # print('image.shape: ', image.shape) # torch.Size([3, 800, 800])
-    # print('gs_depth.shape: ', depth_gs.shape) # ([1, 800, 800])
-
-    # if iteration % 5000 == 0:
-    #     depth_np = depth_gs.squeeze().cpu().detach().numpy()
-    #     # depth_np = np.clip(depth_np * 255, 0, 255).astype(np.uint8)
-    #     depth_min = depth_np.min()
-    #     depth_max = depth_np.max()
-    #     depth_range = depth_max - depth_min
-    #     depth_scaled = (depth_np - depth_min) / depth_range  # Normalize to 0-1
-    #     depth_uint8 = (depth_scaled * 255).astype(np.uint8)  # Scale to 0-255
-    #     imageio.imwrite('depth_gs.png', depth_uint8)
-    #     # assert False
-
-
-    # if iteration % 500 == 0:
-    #     image_np = image.cpu().detach().numpy()
-    #     image_np = np.transpose(image_np, (1, 2, 0))
-    #     image_np = np.clip(image_np * 255, 0, 255).astype(np.uint8)
-    #     imageio.imwrite('rendered_image.png', image_np)
-
-    
+    # Image loss
     gt_image = viewpoint_cam.original_image.cuda() # (3, 800, 800)
-    render_pkg.backward()
-    assert False
-
-    input = gt_image
-    def create_depth_map(x):
-        return x.mean(dim=1, keepdim=True)
-
-    depth_map = create_depth_map(input) # (3, 1, 800)
-    output = depth_map.sum()
-
-
-
-
-    assert False
-
-    # Depth Loss
-    # print('depth_map_rf', depth_map_rf.shape) # [4096]
-    # print('depth_gs', depth_gs.shape)         # [1, 800, 800]
-    # assert False
-
-    
-    # Loss image
     Ll1 = l1_loss(image, gt_image) # [3, 800, 800]
     loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
     loss.backward()
     iter_end.record()
+
+    '''# Depth map
+    if iteration % 5000 == 0:
+        depth_np = depth_gs.squeeze().cpu().detach().numpy()
+        depth_min, depth_max = depth_np.min(), depth_np.max()
+        depth_range = depth_max - depth_min
+        depth_scaled = (depth_np - depth_min) / depth_range
+        depth_uint8 = (depth_scaled * 255).astype(np.uint8)
+        imageio.imwrite('3dgs_depth.png', depth_uint8)'''
+
+    '''# Rendered img
+    if iteration % 5000 == 0:
+        image_np = image.cpu().detach().numpy()
+        image_np = np.transpose(image_np, (1, 2, 0))
+        image_np = np.clip(image_np * 255, 0, 255).astype(np.uint8)
+        imageio.imwrite('3dgs_rendered_img.png', image_np)'''
+
+    ''''''
+    # gt_image = viewpoint_cam.original_image.cuda() # (3, 800, 800)
+    # test_loss = l1_loss(depth_gs, depth_gs) # [3, 800, 800]
+    # # test_loss.backward()
+    # gradients = torch.autograd.grad(outputs=test_loss, inputs=depth_gs, only_inputs=True)[0]
+    # if torch.any(gradients != 0):
+    #     print('-----------------')
+    #     print(gradients)
+    # assert False
+    # print('----check-----', depth_gs.requires_grad)
+    # print('----depth_gs.grad-----', depth_gs.grad)
+
+    # Loss image
+    # my_loss = torch.sum(depth_gs)/(800*800) # [3, 800, 800]
+    # # my_loss.backward()
+    # gradients = torch.autograd.grad(outputs=my_loss, inputs=depth_gs, only_inputs=True)[0]
+    # print(torch.sum(gradients))
+
 
     with torch.no_grad():
         ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
@@ -367,4 +334,4 @@ for iteration in range(first_iter, n_iterations + 1):
             print("\n[ITER {}] Saving GS Checkpoint".format(iteration))
             torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
-tensorf.save('./log/tensorf_model.th')
+# tensorf.save('./log/tensorf_model.th')
